@@ -1,0 +1,69 @@
+using UnityEngine;
+
+public class AutoSumoSquat : MonoBehaviour
+{
+    [Header("1. 骨架拖放區")]
+    public Transform hips;
+    public Transform leftThigh;
+    public Transform rightThigh;
+    public Transform leftKnee;
+    public Transform rightKnee;
+
+    [Header("2. 深蹲參數控制")]
+    [Range(0f, 1f)] public float squatProgress = 0f; // 0 是站立，1 是完全蹲下
+    public float squatDepth = 0.5f;   // 屁股掉下去的深度
+    public float spreadWidth = 45f;   // 兩腿開開的角度
+    public float bendAngle = 70f;     // 膝蓋彎曲的角度
+    
+    [Header("3. 自動動畫")]
+    public bool useAutoAnimate = true;
+    public float speed = 2.0f;
+
+    // 儲存原始位置
+    private Vector3 initHipsPos;
+    private Quaternion initLThigh, initRThigh, initLKnee, initRKnee;
+
+    void Start()
+    {
+        if (!hips || !leftThigh || !rightThigh || !leftKnee || !rightKnee) {
+            Debug.LogError("請先將所有骨頭拖入腳本的空格中！");
+            return;
+        }
+
+        // 紀錄 T-Pose 原始狀態
+        initHipsPos = hips.localPosition;
+        initLThigh = leftThigh.localRotation;
+        initRThigh = rightThigh.localRotation;
+        initLKnee = leftKnee.localRotation;
+        initRKnee = rightKnee.localRotation;
+    }
+
+    void LateUpdate()
+    {
+        if (useAutoAnimate)
+        {
+            // 讓 Progress 在 0~1 之間循環平滑變動
+            squatProgress = (Mathf.Sin(Time.time * speed) + 1f) / 2f;
+        }
+
+        ApplySquat(squatProgress);
+    }
+
+    void ApplySquat(float t)
+    {
+        // --- 1. 屁股下沉 ---
+        hips.localPosition = initHipsPos + Vector3.down * (squatDepth * t);
+
+        // --- 2. 大腿：一邊往外開(Y)，一邊往上抬(X) ---
+        // 左大腿
+        leftThigh.localRotation = initLThigh * Quaternion.Euler(-bendAngle * t, spreadWidth * t, 0);
+        // 右大腿 (Y 軸反向)
+        rightThigh.localRotation = initRThigh * Quaternion.Euler(-bendAngle * t, -spreadWidth * t, 0);
+
+        // --- 3. 膝蓋：小腿往後彎 (與大腿反向) ---
+        // 注意：這裡通常是 X 軸正向旋轉
+        float kneeFlex = bendAngle * 1.5f * t; // 膝蓋彎曲通常是大腿角度的 1.5 倍比較自然
+        leftKnee.localRotation = initLKnee * Quaternion.Euler(kneeFlex, 0, 0);
+        rightKnee.localRotation = initRKnee * Quaternion.Euler(kneeFlex, 0, 0);
+    }
+}
