@@ -1,229 +1,180 @@
 using UnityEngine;
-using UnityEngine.UI;
+using System.IO;
 using System.Collections.Generic;
 
-public class HipsWaveTracker : MonoBehaviour
+public class SquatController : MonoBehaviour
 {
-    [Header("偵測對象")]
-    public Transform hipsTransform;     
-    public Transform footTransform;     
+    [Header("關節物件綁定")]
+    public Transform shinTransform;   // 小腿 (綠色)
+    public Transform thighTransform;  // 大腿 (紅色)
+    public Transform torsoTransform;  // 軀幹 (藍色)
 
-    [Header("UI 顯示物件")]
-    public RectTransform waveBackground; 
-    public RectTransform trackerPoint;   
-    
-    [Header("波形參數設定")]
-    public float waveSpeed = 80f;        
-    public float lineWidth = 3f; // 軌跡線條的粗細 (像素)
-    
-    [Header("圓滑度設定 (數字越小越圓滑，建議 2~5)")]
-    public int smoothFactor = 3;
+    [Header("測試用感測器絕對角度 (相對於地面夾角)")]
+    [Range(0f, 180f)]  public float shinSensorAngle = 90f;  
+    [Range(0f, 180f)]  public float thighSensorAngle = 90f; 
+    [Range(0f, 180f)]  public float torsoSensorAngle = 90f; 
 
-    [Header("動態淡出消失設定")]
-    [Tooltip("深蹲結束後，畫布幾秒內會完全淡出消失")]
-    public float fadeOutDuration = 2f;
+    [Header("CSV 檔案讀取設定")]
+    [Tooltip("請把 CSV 檔案放在 Assets/ 之下，並在這邊輸入不含副檔名的名稱")]
+    public string csvFileName = "RUser_RD_260126";
 
-    private List<GameObject> segmentPool = new List<GameObject>();
-    private List<Vector2> rawPoints = new List<Vector2>(); // 儲存歷史點
-    private Vector2 lastDrawnPoint;
-    private bool isFirstPointInRound = true;
-    
-    private float fixedX; // 紅點鎖死在原地的 X 座標
-    private float startY;      
-    
-    private float maxHipsY;      
-    private float minHipsY;      
-    private float hipsMoveRange; 
-    private float uiBottomY;     
-    private float uiMoveRange;   
-    private bool isInitialized = false;
+    [Header("IMU 自動數據驅動")]
+    public bool useIMUData = false; 
+    [Range(0.1f, 3f)] public float playbackSpeedScale = 1.0f; 
 
-    // 用於淡出消失的變數
-    private bool isFinished = false;
-    private float fadeTimer = 0f;
-    private CanvasGroup backgroundCanvasGroup;
+    // 用來儲存從 CSV 直接讀取出來的真實 Angle 數據流
+    private List<float> csvRawAngles = new List<float>();
+    private int currentIndex = 0;
+    private float timer = 0f;
+    private const float sampleRateDeltaTime = 0.033f; // 30 FPS
+
+    private float shinLength;  
+    private float thighLength;
+    private bool isDataReady = false;
 
     void Start()
     {
-        if (waveBackground != null && trackerPoint != null)
+        // === 關鍵核心：完全保留你原本最對、最安全的長度偵測 ===
+        Vector3 footAnklePos = transform.position;        // 腳掌(腳踝)位置
+        Vector3 shinKneePos = shinTransform.position;     // 小腿(膝蓋)位置
+        Vector3 thighHipPos = thighTransform.position;    // 髖關節位置
+
+        shinLength = Vector3.Distance(shinKneePos, footAnklePos);
+        thighLength = Vector3.Distance(thighHipPos, shinKneePos);
+        
+        Debug.Log($"[骨架自動對準成功] 偵測小腿長度: {shinLength}, 大腿長度: {thighLength}");
+
+        // 自動讀取專案裡的 CSV
+        LoadCSVData();
+    }
+
+    void LoadCSVData()
+    {
+        TextAsset csvTextAsset = Resources.Load<TextAsset>(csvFileName);
+        string[] lines;
+
+        if (csvTextAsset != null)
         {
-            trackerPoint.anchorMin = new Vector2(0.5f, 0.5f);
-            trackerPoint.anchorMax = new Vector2(0.5f, 0.5f);
-            trackerPoint.pivot = new Vector2(0.5f, 0.5f);
-
-            // 【關鍵修改】：記住原本紅點的 X 座標。之後 X 軸完全不動，只保留這個固定點
-            fixedX = trackerPoint.localPosition.x; 
-            startY = trackerPoint.localPosition.y; 
-
-            uiBottomY = -waveBackground.rect.height / 2f;
-            uiMoveRange = startY - uiBottomY; 
-
-            // 自動在畫布加上 CanvasGroup，以便後面做完美的漸變淡出
-            backgroundCanvasGroup = waveBackground.gameObject.GetComponent<CanvasGroup>();
-            if (backgroundCanvasGroup == null)
+            lines = csvTextAsset.text.Split('\n');
+        }
+        else
+        {
+            string filePath = Path.Combine(Application.dataPath, csvFileName + ".csv");
+            if (File.Exists(filePath))
             {
-                backgroundCanvasGroup = waveBackground.gameObject.AddComponent<CanvasGroup>();
+                lines = File.ReadAllLines(filePath);
             }
+            else
+            {
+                Debug.LogError($"[錯誤] 找不到您的 CSV 檔案！請確認檔名為 {csvFileName}.csv 且放在 Assets 資料夾下。");
+                return;
+            }
+        }
+
+        // 尋找欄位標頭 (Time, VL EMG, VMO EMG, Angle...) 所在的行數
+        int headerLineIndex = -1;
+        for (int i = 0; i < lines.Length; i++)
+        {
+            if (lines[i].Contains("Time") && lines[i].Contains("Angle"))
+            {
+                headerLineIndex = i;
+                break;
+            }
+        }
+
+        if (headerLineIndex == -1) headerLineIndex = 4;
+
+        // 讀取真實的 Angle 數據
+        for (int i = headerLineIndex + 1; i < lines.Length; i++)
+        {
+            string line = lines[i].Trim();
+            if (string.IsNullOrEmpty(line)) continue;
+
+            string[] columns = line.Split(',');
+            if (columns.Length < 4) continue;
+
+            try
+            {
+                // 直接讀取你 CSV 第 4 欄 (索引 3) 的 Angle 數據
+                float rawAngle = float.Parse(columns[3]);
+                csvRawAngles.Add(rawAngle);
+            }
+            catch (System.Exception)
+            {
+                // 忽略解析錯誤行
+            }
+        }
+
+        // 每兩筆抽樣一筆，讓它完美匹配 30 FPS 播放速度，避免太快
+        List<float> sampledAngles = new List<float>();
+        for (int i = 0; i < csvRawAngles.Count; i += 2)
+        {
+            sampledAngles.Add(csvRawAngles[i]);
+        }
+        csvRawAngles = sampledAngles;
+
+        if (csvRawAngles.Count > 0)
+        {
+            isDataReady = true;
+            Debug.Log($"[CSV 載入成功] 已讀取 {csvRawAngles.Count} 筆真實膝蓋角度數據！");
         }
     }
 
     void Update()
     {
-        if (hipsTransform == null || trackerPoint == null || waveBackground == null || footTransform == null) return;
-
-        if (!isInitialized)
+        // === 1. 如果開啟 IMU，自動用 CSV 的 Angle 來帶動你的三個角度拉桿 ===
+        if (useIMUData && isDataReady && csvRawAngles.Count > 0)
         {
-            maxHipsY = hipsTransform.position.y; 
-            minHipsY = footTransform.position.y; 
-            hipsMoveRange = maxHipsY - minHipsY;
-            if (hipsMoveRange <= 0) hipsMoveRange = 0.1f;
-            
-            isInitialized = true;
-            return;
-        }
-
-        // === 畫布與波形消失邏輯 ===
-        if (isFinished)
-        {
-            HandleFadeOut();
-            return;
-        }
-
-        // 計算當前下蹲進度
-        float squatProgress = (maxHipsY - hipsTransform.position.y) / hipsMoveRange;
-        squatProgress = Mathf.Clamp01(squatProgress);
-
-        float finalUIY = startY - (squatProgress * uiMoveRange);
-        
-        // === 1. 【紅點只在原地移動】 ===
-        // X 座標永遠鎖死在 fixedX，只有 Y 座標會隨著深蹲上下起伏！
-        trackerPoint.localPosition = new Vector3(fixedX, finalUIY, 0f);
-
-        // === 2. 【畫布背景往左跑】 ===
-        // 讓白色背景板不斷往左邊平移，產生波形滾動效果
-        waveBackground.anchoredPosition += Vector2.left * waveSpeed * Time.deltaTime;
-
-        // === 3. 【產生平滑軌跡線】 ===
-        // 我們利用「世界座標」或「畫布相對座標」來記錄點，並將新點連線
-        Vector2 currentPoint = trackerPoint.anchoredPosition;
-
-        // 因為畫布在往左動，所以我們要在當前紅點的「世界/畫布相對位置」生成線段
-        rawPoints.Add(currentPoint);
-        DrawSmoothLine();
-
-        // 為了節省手機或電腦效能，自動清理已經移出畫面左邊、看不見的線段
-        CleanupOffscreenSegments();
-
-        // 【測試用消失開關】：按鍵盤 Space 鍵，或者當你的深蹲程式播放完畢時呼叫 `FinishAndFadeOut()`
-        if (Input.GetKeyDown(KeyCode.Space))
-        {
-            FinishAndFadeOut();
-        }
-    }
-
-    void DrawSmoothLine()
-    {
-        if (rawPoints.Count < 2) return;
-
-        if (isFirstPointInRound)
-        {
-            lastDrawnPoint = rawPoints[0];
-            isFirstPointInRound = false;
-        }
-
-        Vector2 targetPoint = rawPoints[rawPoints.Count - 1];
-        Vector2 prevPoint = rawPoints[rawPoints.Count - 2];
-
-        int segments = smoothFactor;
-        for (int i = 1; i <= segments; i++)
-        {
-            float t = (float)i / segments;
-            Vector2 smoothedPoint = Vector2.Lerp(prevPoint, targetPoint, t);
-            
-            CreateUISegment(lastDrawnPoint, smoothedPoint);
-            lastDrawnPoint = smoothedPoint;
-        }
-    }
-
-    void CreateUISegment(Vector2 start, Vector2 end)
-    {
-        if (Vector2.Distance(start, end) < 0.1f) return;
-
-        GameObject segment = new GameObject("UI_Smooth_Line_Segment", typeof(Image));
-        segment.transform.SetParent(waveBackground, false);
-        segment.transform.SetAsFirstSibling(); 
-
-        Image img = segment.GetComponent<Image>();
-        img.color = Color.red; 
-
-        RectTransform rect = segment.GetComponent<RectTransform>();
-        rect.anchorMin = new Vector2(0.5f, 0.5f);
-        rect.anchorMax = new Vector2(0.5f, 0.5f);
-        rect.pivot = new Vector2(0f, 0.5f); 
-
-        Vector2 dir = end - start;
-        float distance = dir.magnitude;
-        float angle = Mathf.Atan2(dir.y, dir.x) * Mathf.Rad2Deg;
-
-        rect.anchoredPosition = start;
-        rect.sizeDelta = new Vector2(distance, lineWidth);
-        rect.localRotation = Quaternion.Euler(0, 0, angle);
-
-        segmentPool.Add(segment);
-    }
-
-    // 效能優化：把已經移到畫面最左邊、看不見的線段自動刪除
-    void CleanupOffscreenSegments()
-    {
-        float leftBoundary = -waveBackground.rect.width;
-        for (int i = segmentPool.Count - 1; i >= 0; i--)
-        {
-            GameObject seg = segmentPool[i];
-            if (seg != null)
+            timer += Time.deltaTime;
+            if (timer >= sampleRateDeltaTime / playbackSpeedScale)
             {
-                RectTransform rect = seg.GetComponent<RectTransform>();
-                // 如果線段的 X 座標已經超出畫布左側範圍，就直接銷毀它
-                if (rect.anchoredPosition.x < leftBoundary)
-                {
-                    Destroy(seg);
-                    segmentPool.RemoveAt(i);
-                }
+                timer = 0f;
+                float currentAngleVal = csvRawAngles[currentIndex];
+
+                // 透過 InverseLerp，將你的 CSV Angle (0 到 92 度) 標準化成 0 到 1 的進度值
+                // 這樣能完美保留你多次下蹲、深淺不同、速度不同的所有真實動態細節！
+                float progress = Mathf.InverseLerp(0f, 92f, currentAngleVal);
+
+                // 根據這個進度，去改變你原本的三個拉桿數值
+                // 這是你前幾步測出來最完美、最正確的深蹲旋轉區間：
+                shinSensorAngle = Mathf.Lerp(90f, 153f, progress);  // 小腿向右傾倒至 153 度
+                thighSensorAngle = Mathf.Lerp(90f, 33f, progress);   // 大腿向左折疊至 33 度
+                torsoSensorAngle = 90f;                             // 軀幹保持 90 度 (或視需要調整)
+
+                currentIndex = (currentIndex + 1) % csvRawAngles.Count;
             }
         }
-    }
 
-    // === 4. 【當深蹲播完或結束時呼叫此功能】 ===
-    public void FinishAndFadeOut()
-    {
-        isFinished = true;
-        fadeTimer = 0f;
-    }
+        // === 2. 旋轉角度套用 —— 完全保留你原本最對的寫法 ===
+        shinTransform.rotation = Quaternion.Euler(0, 0, 90f - shinSensorAngle);
+        thighTransform.rotation = Quaternion.Euler(0, 0, 90f - thighSensorAngle);
+        torsoTransform.rotation = Quaternion.Euler(0, 0, 90f - torsoSensorAngle);
 
-    // 處理畫布與紅點、線條的完美淡出與關閉
-    private void HandleFadeOut()
-    {
-        fadeTimer += Time.deltaTime;
-        float alpha = Mathf.Lerp(1f, 0f, fadeTimer / fadeOutDuration);
+        // === 3. 由上而下的精準關節連動 —— 完全保留你原本最對的寫法，一字不差 ===
+        Vector3 footPos = transform.position;
 
-        if (backgroundCanvasGroup != null)
-        {
-            backgroundCanvasGroup.alpha = alpha;
-        }
+        float shinRad = shinSensorAngle * Mathf.Deg2Rad;
+        float thighRad = thighSensorAngle * Mathf.Deg2Rad;
 
-        // 徹底消失後關閉物件，完全不佔資源
-        if (alpha <= 0.01f)
-        {
-            waveBackground.gameObject.SetActive(false);
-            gameObject.SetActive(false); // 關閉此管理器
-        }
-    }
+        // 由下往上算出「髖關節（屁股）」的精準位置
+        Vector3 hipPos = new Vector3(
+            footPos.x - (shinLength * Mathf.Cos(shinRad) + thighLength * Mathf.Cos(thighRad)),
+            footPos.y + (shinLength * Mathf.Sin(shinRad) + thighLength * Mathf.Sin(thighRad)),
+            footPos.z
+        );
 
-    void ClearAllSegments()
-    {
-        foreach (GameObject seg in segmentPool)
-        {
-            if (seg != null) Destroy(seg);
-        }
-        segmentPool.Clear();
+        // 各地點精準對位鎖死
+        thighTransform.position = hipPos;
+        torsoTransform.position = hipPos;
+
+        // 從屁股往回推計算膝蓋位置
+        Vector3 kneePos = new Vector3(
+            hipPos.x + thighLength * Mathf.Cos(thighRad),
+            hipPos.y - thighLength * Mathf.Sin(thighRad),
+            hipPos.z
+        );
+
+        // 補上原本缺少的最後一步，讓小腿頂端跟著膝蓋點走，確保關節不裂開
+        shinTransform.position = kneePos;
     }
 }
