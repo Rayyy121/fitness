@@ -1,0 +1,229 @@
+using UnityEngine;
+using UnityEngine.UI;
+using System.Collections.Generic;
+
+public class HipsWaveTracker : MonoBehaviour
+{
+    [Header("偵測對象")]
+    public Transform hipsTransform;     
+    public Transform footTransform;     
+
+    [Header("UI 顯示物件")]
+    public RectTransform waveBackground; 
+    public RectTransform trackerPoint;   
+    
+    [Header("波形參數設定")]
+    public float waveSpeed = 80f;        
+    public float lineWidth = 3f; // 軌跡線條的粗細 (像素)
+    
+    [Header("圓滑度設定 (數字越小越圓滑，建議 2~5)")]
+    public int smoothFactor = 3;
+
+    [Header("動態淡出消失設定")]
+    [Tooltip("深蹲結束後，畫布幾秒內會完全淡出消失")]
+    public float fadeOutDuration = 2f;
+
+    private List<GameObject> segmentPool = new List<GameObject>();
+    private List<Vector2> rawPoints = new List<Vector2>(); // 儲存歷史點
+    private Vector2 lastDrawnPoint;
+    private bool isFirstPointInRound = true;
+    
+    private float fixedX; // 紅點鎖死在原地的 X 座標
+    private float startY;      
+    
+    private float maxHipsY;      
+    private float minHipsY;      
+    private float hipsMoveRange; 
+    private float uiBottomY;     
+    private float uiMoveRange;   
+    private bool isInitialized = false;
+
+    // 用於淡出消失的變數
+    private bool isFinished = false;
+    private float fadeTimer = 0f;
+    private CanvasGroup backgroundCanvasGroup;
+
+    void Start()
+    {
+        if (waveBackground != null && trackerPoint != null)
+        {
+            trackerPoint.anchorMin = new Vector2(0.5f, 0.5f);
+            trackerPoint.anchorMax = new Vector2(0.5f, 0.5f);
+            trackerPoint.pivot = new Vector2(0.5f, 0.5f);
+
+            // 【關鍵修改】：記住原本紅點的 X 座標。之後 X 軸完全不動，只保留這個固定點
+            fixedX = trackerPoint.localPosition.x; 
+            startY = trackerPoint.localPosition.y; 
+
+            uiBottomY = -waveBackground.rect.height / 2f;
+            uiMoveRange = startY - uiBottomY; 
+
+            // 自動在畫布加上 CanvasGroup，以便後面做完美的漸變淡出
+            backgroundCanvasGroup = waveBackground.gameObject.GetComponent<CanvasGroup>();
+            if (backgroundCanvasGroup == null)
+            {
+                backgroundCanvasGroup = waveBackground.gameObject.AddComponent<CanvasGroup>();
+            }
+        }
+    }
+
+    void Update()
+    {
+        if (hipsTransform == null || trackerPoint == null || waveBackground == null || footTransform == null) return;
+
+        if (!isInitialized)
+        {
+            maxHipsY = hipsTransform.position.y; 
+            minHipsY = footTransform.position.y; 
+            hipsMoveRange = maxHipsY - minHipsY;
+            if (hipsMoveRange <= 0) hipsMoveRange = 0.1f;
+            
+            isInitialized = true;
+            return;
+        }
+
+        // === 畫布與波形消失邏輯 ===
+        if (isFinished)
+        {
+            HandleFadeOut();
+            return;
+        }
+
+        // 計算當前下蹲進度
+        float squatProgress = (maxHipsY - hipsTransform.position.y) / hipsMoveRange;
+        squatProgress = Mathf.Clamp01(squatProgress);
+
+        float finalUIY = startY - (squatProgress * uiMoveRange);
+        
+        // === 1. 【紅點只在原地移動】 ===
+        // X 座標永遠鎖死在 fixedX，只有 Y 座標會隨著深蹲上下起伏！
+        trackerPoint.localPosition = new Vector3(fixedX, finalUIY, 0f);
+
+        // === 2. 【畫布背景往左跑】 ===
+        // 讓白色背景板不斷往左邊平移，產生波形滾動效果
+        waveBackground.anchoredPosition += Vector2.left * waveSpeed * Time.deltaTime;
+
+        // === 3. 【產生平滑軌跡線】 ===
+        // 我們利用「世界座標」或「畫布相對座標」來記錄點，並將新點連線
+        Vector2 currentPoint = trackerPoint.anchoredPosition;
+
+        // 因為畫布在往左動，所以我們要在當前紅點的「世界/畫布相對位置」生成線段
+        rawPoints.Add(currentPoint);
+        DrawSmoothLine();
+
+        // 為了節省手機或電腦效能，自動清理已經移出畫面左邊、看不見的線段
+        CleanupOffscreenSegments();
+
+        // 【測試用消失開關】：按鍵盤 Space 鍵，或者當你的深蹲程式播放完畢時呼叫 `FinishAndFadeOut()`
+        if (Input.GetKeyDown(KeyCode.Space))
+        {
+            FinishAndFadeOut();
+        }
+    }
+
+    void DrawSmoothLine()
+    {
+        if (rawPoints.Count < 2) return;
+
+        if (isFirstPointInRound)
+        {
+            lastDrawnPoint = rawPoints[0];
+            isFirstPointInRound = false;
+        }
+
+        Vector2 targetPoint = rawPoints[rawPoints.Count - 1];
+        Vector2 prevPoint = rawPoints[rawPoints.Count - 2];
+
+        int segments = smoothFactor;
+        for (int i = 1; i <= segments; i++)
+        {
+            float t = (float)i / segments;
+            Vector2 smoothedPoint = Vector2.Lerp(prevPoint, targetPoint, t);
+            
+            CreateUISegment(lastDrawnPoint, smoothedPoint);
+            lastDrawnPoint = smoothedPoint;
+        }
+    }
+
+    void CreateUISegment(Vector2 start, Vector2 end)
+    {
+        if (Vector2.Distance(start, end) < 0.1f) return;
+
+        GameObject segment = new GameObject("UI_Smooth_Line_Segment", typeof(Image));
+        segment.transform.SetParent(waveBackground, false);
+        segment.transform.SetAsFirstSibling(); 
+
+        Image img = segment.GetComponent<Image>();
+        img.color = Color.red; 
+
+        RectTransform rect = segment.GetComponent<RectTransform>();
+        rect.anchorMin = new Vector2(0.5f, 0.5f);
+        rect.anchorMax = new Vector2(0.5f, 0.5f);
+        rect.pivot = new Vector2(0f, 0.5f); 
+
+        Vector2 dir = end - start;
+        float distance = dir.magnitude;
+        float angle = Mathf.Atan2(dir.y, dir.x) * Mathf.Rad2Deg;
+
+        rect.anchoredPosition = start;
+        rect.sizeDelta = new Vector2(distance, lineWidth);
+        rect.localRotation = Quaternion.Euler(0, 0, angle);
+
+        segmentPool.Add(segment);
+    }
+
+    // 效能優化：把已經移到畫面最左邊、看不見的線段自動刪除
+    void CleanupOffscreenSegments()
+    {
+        float leftBoundary = -waveBackground.rect.width;
+        for (int i = segmentPool.Count - 1; i >= 0; i--)
+        {
+            GameObject seg = segmentPool[i];
+            if (seg != null)
+            {
+                RectTransform rect = seg.GetComponent<RectTransform>();
+                // 如果線段的 X 座標已經超出畫布左側範圍，就直接銷毀它
+                if (rect.anchoredPosition.x < leftBoundary)
+                {
+                    Destroy(seg);
+                    segmentPool.RemoveAt(i);
+                }
+            }
+        }
+    }
+
+    // === 4. 【當深蹲播完或結束時呼叫此功能】 ===
+    public void FinishAndFadeOut()
+    {
+        isFinished = true;
+        fadeTimer = 0f;
+    }
+
+    // 處理畫布與紅點、線條的完美淡出與關閉
+    private void HandleFadeOut()
+    {
+        fadeTimer += Time.deltaTime;
+        float alpha = Mathf.Lerp(1f, 0f, fadeTimer / fadeOutDuration);
+
+        if (backgroundCanvasGroup != null)
+        {
+            backgroundCanvasGroup.alpha = alpha;
+        }
+
+        // 徹底消失後關閉物件，完全不佔資源
+        if (alpha <= 0.01f)
+        {
+            waveBackground.gameObject.SetActive(false);
+            gameObject.SetActive(false); // 關閉此管理器
+        }
+    }
+
+    void ClearAllSegments()
+    {
+        foreach (GameObject seg in segmentPool)
+        {
+            if (seg != null) Destroy(seg);
+        }
+        segmentPool.Clear();
+    }
+}
