@@ -1,0 +1,255 @@
+using UnityEngine;
+using UnityEngine.UI;
+using System.Collections.Generic;
+
+public class HipsWaveTracker : MonoBehaviour
+{
+    [Header("偵測對象")]
+    public Transform hipsTransform;     
+    public Transform footTransform;     
+
+    [Header("UI 顯示物件")]
+    public RectTransform waveBackground;   // 主背景 (第一張)
+    public RectTransform waveBackground2;  // 無限接力背景 (第二張)
+    public RectTransform trackerPoint;     // 紅點
+    
+    [Header("波形參數設定")]
+    public float waveSpeed = 80f;        
+    public float lineWidth = 5f;            // 線條粗細 (預設 5f 剛好顯眼)
+    public float amplitudeMultiplier = 1.8f;// 高度變化放大倍率
+    
+    [Header("平滑度設定")]
+    [Tooltip("紅點上下跟隨的平滑時間，數字越小跟越緊，數字越大越圓滑 (建議 0.05 ~ 0.15)")]
+    public float smoothTime = 0.08f; 
+    public float minSegmentDistance = 1.5f; // 防止生成過密碎線的最小距離
+
+    [Header("動態淡出消失設定")]
+    public float fadeOutDuration = 2f;
+
+    private List<GameObject> segmentPool = new List<GameObject>();
+    private Vector2 lastDrawnPoint;
+    private bool isFirstPoint = true;
+    
+    private float fixedX; 
+    private float startY;      
+    private float bgWidth;
+
+    private float maxHipsY;      
+    private float minHipsY;      
+    private float hipsMoveRange; 
+    private float uiBottomY;     
+    private float uiMoveRange;   
+    private bool isInitialized = false;
+
+    private float currentUIY;       // 當前 UI 的 Y 軸（用於平滑計算）
+    private float yVelocity = 0f;    // Mathf.SmoothDamp 專用速度緩衝
+
+    private bool isFinished = false;
+    private float fadeTimer = 0f;
+    private CanvasGroup canvasGroup1;
+    private CanvasGroup canvasGroup2;
+
+    void Start()
+    {
+        if (waveBackground != null && trackerPoint != null)
+        {
+            // 確保兩張白色背景登場時都是完全乾淨純白的
+            ClearExistingChildSegments(waveBackground);
+            if (waveBackground2 != null)
+            {
+                ClearExistingChildSegments(waveBackground2);
+            }
+
+            // 設定紅點 Pivot 與 Anchor
+            trackerPoint.anchorMin = new Vector2(0.5f, 0.5f);
+            trackerPoint.anchorMax = new Vector2(0.5f, 0.5f);
+            trackerPoint.pivot = new Vector2(0.5f, 0.5f);
+
+            // 記憶紅點絕對位置
+            fixedX = trackerPoint.position.x; 
+            startY = trackerPoint.localPosition.y; 
+            currentUIY = startY;
+
+            uiBottomY = -waveBackground.rect.height / 2f;
+            uiMoveRange = startY - uiBottomY; 
+            bgWidth = waveBackground.rect.width;
+
+            // 自動將第二張背景接在第一張背景的右側
+            if (waveBackground2 != null)
+            {
+                waveBackground2.anchoredPosition = waveBackground.anchoredPosition + new Vector2(bgWidth, 0f);
+            }
+
+            // 初始化淡出控制組件
+            canvasGroup1 = waveBackground.gameObject.GetComponent<CanvasGroup>();
+            if (canvasGroup1 == null) canvasGroup1 = waveBackground.gameObject.AddComponent<CanvasGroup>();
+
+            if (waveBackground2 != null)
+            {
+                canvasGroup2 = waveBackground2.gameObject.GetComponent<CanvasGroup>();
+                if (canvasGroup2 == null) canvasGroup2 = waveBackground2.gameObject.AddComponent<CanvasGroup>();
+            }
+        }
+    }
+
+    void Update()
+    {
+        if (hipsTransform == null || trackerPoint == null || waveBackground == null || footTransform == null) return;
+
+        if (!isInitialized)
+        {
+            maxHipsY = hipsTransform.position.y; 
+            minHipsY = footTransform.position.y; 
+            hipsMoveRange = maxHipsY - minHipsY;
+            if (hipsMoveRange <= 0) hipsMoveRange = 0.1f;
+            
+            isInitialized = true;
+            return;
+        }
+
+        if (isFinished)
+        {
+            HandleFadeOut();
+            return;
+        }
+
+        // 1. 計算深蹲目標高度
+        float squatProgress = (maxHipsY - hipsTransform.position.y) / hipsMoveRange;
+        squatProgress = Mathf.Clamp01(squatProgress);
+
+        float amplifiedProgress = squatProgress * amplitudeMultiplier;
+        amplifiedProgress = Mathf.Clamp01(amplifiedProgress);
+
+        float targetUIY = startY - (amplifiedProgress * uiMoveRange);
+
+        // 【關鍵改進 1】：用 SmoothDamp 對 Y 軸進行彈性平滑濾波，消除猛烈拉動時產生的折角條碼！
+        currentUIY = Mathf.SmoothDamp(currentUIY, targetUIY, ref yVelocity, smoothTime);
+        
+        // 鎖定紅點的 X 軸，讓它只在縱軸順暢滑動
+        trackerPoint.position = new Vector3(fixedX, trackerPoint.position.y, trackerPoint.position.z);
+        trackerPoint.localPosition = new Vector3(trackerPoint.localPosition.x, currentUIY, trackerPoint.localPosition.z);
+
+        // 2. 兩張背景同步向左移動 (完全保留你的無限向左移動邏輯)
+        Vector2 moveOffset = Vector2.left * waveSpeed * Time.deltaTime;
+        waveBackground.anchoredPosition += moveOffset;
+        if (waveBackground2 != null)
+        {
+            waveBackground2.anchoredPosition += moveOffset;
+        }
+
+        // 3. 無限循環背景邏輯 (完全保留你的 logic)
+        if (waveBackground.anchoredPosition.x <= -bgWidth)
+        {
+            waveBackground.anchoredPosition += new Vector2(bgWidth * 2f, 0f);
+        }
+        if (waveBackground2 != null && waveBackground2.anchoredPosition.x <= -bgWidth)
+        {
+            waveBackground2.anchoredPosition += new Vector2(bgWidth * 2f, 0f);
+        }
+
+        // 4. 計算並繪製軌跡
+        Vector2 currentPointInBackground = waveBackground.InverseTransformPoint(trackerPoint.position);
+        
+        if (isFirstPoint)
+        {
+            lastDrawnPoint = currentPointInBackground;
+            isFirstPoint = false;
+        }
+        else
+        {
+            // 【關鍵改進 2】：距離大於設定值才連線，防止微小抖動產生無效碎圖片
+            if (Vector2.Distance(lastDrawnPoint, currentPointInBackground) >= minSegmentDistance)
+            {
+                CreateUISegment(lastDrawnPoint, currentPointInBackground);
+                lastDrawnPoint = currentPointInBackground;
+            }
+        }
+
+        CleanupOffscreenSegments();
+
+        if (Input.GetKeyDown(KeyCode.Space))
+        {
+            FinishAndFadeOut();
+        }
+    }
+
+    void CreateUISegment(Vector2 start, Vector2 end)
+    {
+        GameObject segment = new GameObject("UI_Smooth_Line_Segment", typeof(Image));
+        segment.transform.SetParent(waveBackground, false);
+        
+        // 確保線段壓在背景正前方
+        segment.transform.SetAsLastSibling(); 
+
+        Image img = segment.GetComponent<Image>();
+        img.color = Color.red; 
+
+        RectTransform rect = segment.GetComponent<RectTransform>();
+        rect.anchorMin = new Vector2(0.5f, 0.5f);
+        rect.anchorMax = new Vector2(0.5f, 0.5f);
+        rect.pivot = new Vector2(0f, 0.5f); 
+
+        Vector2 dir = end - start;
+        float distance = dir.magnitude;
+        float angle = Mathf.Atan2(dir.y, dir.x) * Mathf.Rad2Deg;
+
+        rect.anchoredPosition = start;
+        rect.sizeDelta = new Vector2(distance, lineWidth);
+        rect.localRotation = Quaternion.Euler(0, 0, angle);
+
+        segmentPool.Add(segment);
+    }
+
+    void ClearExistingChildSegments(Transform parent)
+    {
+        for (int i = parent.childCount - 1; i >= 0; i--)
+        {
+            Transform child = parent.GetChild(i);
+            if (child != trackerPoint)
+            {
+                Destroy(child.gameObject);
+            }
+        }
+    }
+
+    void CleanupOffscreenSegments()
+    {
+        // 清理超過背景左邊界的線段段落，保持極佳效能
+        float leftBoundary = -bgWidth * 1.5f;
+        for (int i = segmentPool.Count - 1; i >= 0; i--)
+        {
+            GameObject seg = segmentPool[i];
+            if (seg != null)
+            {
+                RectTransform rect = seg.GetComponent<RectTransform>();
+                if (rect.anchoredPosition.x < leftBoundary)
+                {
+                    Destroy(seg);
+                    segmentPool.RemoveAt(i);
+                }
+            }
+        }
+    }
+
+    public void FinishAndFadeOut()
+    {
+        isFinished = true;
+        fadeTimer = 0f;
+    }
+
+    private void HandleFadeOut()
+    {
+        fadeTimer += Time.deltaTime;
+        float alpha = Mathf.Lerp(1f, 0f, fadeTimer / fadeOutDuration);
+
+        if (canvasGroup1 != null) canvasGroup1.alpha = alpha;
+        if (canvasGroup2 != null) canvasGroup2.alpha = alpha;
+
+        if (alpha <= 0.01f)
+        {
+            waveBackground.gameObject.SetActive(false);
+            if (waveBackground2 != null) waveBackground2.gameObject.SetActive(false);
+            gameObject.SetActive(false); 
+        }
+    }
+}
