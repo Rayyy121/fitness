@@ -4,105 +4,115 @@ using System.Collections.Generic;
 
 public class HipsWaveTracker : MonoBehaviour
 {
+    [Header("開始畫面設定")]
+    public GameObject startMenuPanel;
+    public bool isGameStarted = false;
+
     [Header("偵測對象")]
-    public Transform hipsTransform;     
-    public Transform footTransform;     
+    public Transform hipsTransform;
+    public Transform footTransform;
 
     [Header("UI 顯示物件")]
-    public RectTransform waveBackground;   // 主背景 (第一張)
-    public RectTransform waveBackground2;  // 無限接力背景 (第二張)
+    public RectTransform waveBackground;   // 當前顯示的第一張白色背景
     public RectTransform trackerPoint;     // 紅點
-    
+
     [Header("波形參數設定")]
-    public float waveSpeed = 80f;        
-    public float lineWidth = 5f;            // 線條粗細 (預設 5f 剛好顯眼)
-    public float amplitudeMultiplier = 1.8f;// 高度變化放大倍率
-    
+    public float waveSpeed = 80f;
+    public float lineWidth = 5f;
+    public float amplitudeMultiplier = 1.8f;
+
     [Header("平滑度設定")]
-    [Tooltip("紅點上下跟隨的平滑時間，數字越小跟越緊，數字越大越圓滑 (建議 0.05 ~ 0.15)")]
-    public float smoothTime = 0.08f; 
-    public float minSegmentDistance = 1.5f; // 防止生成過密碎線的最小距離
+    public float smoothTime = 0.08f;
+    public float minSegmentDistance = 1.5f;
 
     [Header("動態淡出消失設定")]
     public float fadeOutDuration = 2f;
 
-    private List<GameObject> segmentPool = new List<GameObject>();
-    private Vector2 lastDrawnPoint;
-    private bool isFirstPoint = true;
-    
-    private float fixedX; 
-    private float startY;      
+    // 背景動態佇列
+    private List<RectTransform> activeBackgrounds = new List<RectTransform>();
+    private GameObject cleanBgPrefab; 
     private float bgWidth;
 
-    private float maxHipsY;      
-    private float minHipsY;      
-    private float hipsMoveRange; 
-    private float uiBottomY;     
-    private float uiMoveRange;   
+    // 【關鍵修復變數】
+    private RectTransform lastActiveBg = null; // 記錄上一幀畫在哪一張背景上
+    private Vector2 lastDrawnPoint;
+    private bool isFirstPoint = true;
+
+    private float fixedX;
+    private float startY;
+
+    private float maxHipsY;
+    private float minHipsY;
+    private float hipsMoveRange;
+    private float uiBottomY;
+    private float uiMoveRange;
     private bool isInitialized = false;
 
-    private float currentUIY;       // 當前 UI 的 Y 軸（用於平滑計算）
-    private float yVelocity = 0f;    // Mathf.SmoothDamp 專用速度緩衝
+    private float currentUIY;
+    private float yVelocity = 0f;
 
     private bool isFinished = false;
     private float fadeTimer = 0f;
-    private CanvasGroup canvasGroup1;
-    private CanvasGroup canvasGroup2;
 
     void Start()
     {
+        if (startMenuPanel != null)
+        {
+            startMenuPanel.SetActive(true);
+        }
+
         if (waveBackground != null && trackerPoint != null)
         {
-            // 確保兩張白色背景登場時都是完全乾淨純白的
-            ClearExistingChildSegments(waveBackground);
-            if (waveBackground2 != null)
-            {
-                ClearExistingChildSegments(waveBackground2);
-            }
-
-            // 設定紅點 Pivot 與 Anchor
             trackerPoint.anchorMin = new Vector2(0.5f, 0.5f);
             trackerPoint.anchorMax = new Vector2(0.5f, 0.5f);
             trackerPoint.pivot = new Vector2(0.5f, 0.5f);
 
-            // 記憶紅點絕對位置
-            fixedX = trackerPoint.position.x; 
-            startY = trackerPoint.localPosition.y; 
+            fixedX = trackerPoint.position.x;
+            startY = trackerPoint.localPosition.y;
             currentUIY = startY;
 
             uiBottomY = -waveBackground.rect.height / 2f;
-            uiMoveRange = startY - uiBottomY; 
+            uiMoveRange = startY - uiBottomY;
             bgWidth = waveBackground.rect.width;
 
-            // 自動將第二張背景接在第一張背景的右側
-            if (waveBackground2 != null)
-            {
-                waveBackground2.anchoredPosition = waveBackground.anchoredPosition + new Vector2(bgWidth, 0f);
-            }
+            ClearChildSegmentsImmediate(waveBackground);
 
-            // 初始化淡出控制組件
-            canvasGroup1 = waveBackground.gameObject.GetComponent<CanvasGroup>();
-            if (canvasGroup1 == null) canvasGroup1 = waveBackground.gameObject.AddComponent<CanvasGroup>();
+            // 製作純白空殼樣板
+            cleanBgPrefab = Instantiate(waveBackground.gameObject, waveBackground.parent);
+            cleanBgPrefab.name = "Clean_WaveBackground_Template";
+            ClearChildSegmentsImmediate(cleanBgPrefab.transform);
+            cleanBgPrefab.SetActive(false);
 
-            if (waveBackground2 != null)
-            {
-                canvasGroup2 = waveBackground2.gameObject.GetComponent<CanvasGroup>();
-                if (canvasGroup2 == null) canvasGroup2 = waveBackground2.gameObject.AddComponent<CanvasGroup>();
-            }
+            activeBackgrounds.Add(waveBackground);
+            SpawnNextBackground();
         }
+    }
+
+    public void StartGame()
+    {
+        if (startMenuPanel != null)
+        {
+            startMenuPanel.SetActive(false);
+        }
+
+        isGameStarted = true;
+        isInitialized = false;
+        isFirstPoint = true;
+        lastActiveBg = null;
     }
 
     void Update()
     {
+        if (!isGameStarted) return;
         if (hipsTransform == null || trackerPoint == null || waveBackground == null || footTransform == null) return;
 
         if (!isInitialized)
         {
-            maxHipsY = hipsTransform.position.y; 
-            minHipsY = footTransform.position.y; 
+            maxHipsY = hipsTransform.position.y;
+            minHipsY = footTransform.position.y;
             hipsMoveRange = maxHipsY - minHipsY;
             if (hipsMoveRange <= 0) hipsMoveRange = 0.1f;
-            
+
             isInitialized = true;
             return;
         }
@@ -113,59 +123,85 @@ public class HipsWaveTracker : MonoBehaviour
             return;
         }
 
-        // 1. 計算深蹲目標高度
+        // 1. 計算深蹲動作
         float squatProgress = (maxHipsY - hipsTransform.position.y) / hipsMoveRange;
         squatProgress = Mathf.Clamp01(squatProgress);
 
-        float amplifiedProgress = squatProgress * amplitudeMultiplier;
-        amplifiedProgress = Mathf.Clamp01(amplifiedProgress);
-
+        float amplifiedProgress = Mathf.Clamp01(squatProgress * amplitudeMultiplier);
         float targetUIY = startY - (amplifiedProgress * uiMoveRange);
 
-        // 【關鍵改進 1】：用 SmoothDamp 對 Y 軸進行彈性平滑濾波，消除猛烈拉動時產生的折角條碼！
         currentUIY = Mathf.SmoothDamp(currentUIY, targetUIY, ref yVelocity, smoothTime);
-        
-        // 鎖定紅點的 X 軸，讓它只在縱軸順暢滑動
+
         trackerPoint.position = new Vector3(fixedX, trackerPoint.position.y, trackerPoint.position.z);
         trackerPoint.localPosition = new Vector3(trackerPoint.localPosition.x, currentUIY, trackerPoint.localPosition.z);
 
-        // 2. 兩張背景同步向左移動 (完全保留你的無限向左移動邏輯)
-        Vector2 moveOffset = Vector2.left * waveSpeed * Time.deltaTime;
-        waveBackground.anchoredPosition += moveOffset;
-        if (waveBackground2 != null)
+        // 2. 背景向左推移
+        Vector2 moveStep = Vector2.left * waveSpeed * Time.deltaTime;
+        for (int i = 0; i < activeBackgrounds.Count; i++)
         {
-            waveBackground2.anchoredPosition += moveOffset;
-        }
-
-        // 3. 無限循環背景邏輯 (完全保留你的 logic)
-        if (waveBackground.anchoredPosition.x <= -bgWidth)
-        {
-            waveBackground.anchoredPosition += new Vector2(bgWidth * 2f, 0f);
-        }
-        if (waveBackground2 != null && waveBackground2.anchoredPosition.x <= -bgWidth)
-        {
-            waveBackground2.anchoredPosition += new Vector2(bgWidth * 2f, 0f);
-        }
-
-        // 4. 計算並繪製軌跡
-        Vector2 currentPointInBackground = waveBackground.InverseTransformPoint(trackerPoint.position);
-        
-        if (isFirstPoint)
-        {
-            lastDrawnPoint = currentPointInBackground;
-            isFirstPoint = false;
-        }
-        else
-        {
-            // 【關鍵改進 2】：距離大於設定值才連線，防止微小抖動產生無效碎圖片
-            if (Vector2.Distance(lastDrawnPoint, currentPointInBackground) >= minSegmentDistance)
+            if (activeBackgrounds[i] != null)
             {
-                CreateUISegment(lastDrawnPoint, currentPointInBackground);
-                lastDrawnPoint = currentPointInBackground;
+                activeBackgrounds[i].anchoredPosition += moveStep;
             }
         }
 
-        CleanupOffscreenSegments();
+        // 3. 無縫接軌檢測
+        RectTransform lastBg = activeBackgrounds[activeBackgrounds.Count - 1];
+        float lastBgRightEdge = lastBg.anchoredPosition.x + (bgWidth * (1f - lastBg.pivot.x));
+
+        if (lastBgRightEdge <= bgWidth * 1.5f)
+        {
+            SpawnNextBackground();
+        }
+
+        // 4. 左側背景超出視野後銷毀
+        if (activeBackgrounds.Count > 0)
+        {
+            RectTransform firstBg = activeBackgrounds[0];
+            float firstBgRightEdge = firstBg.anchoredPosition.x + (bgWidth * (1f - firstBg.pivot.x));
+            
+            if (firstBgRightEdge < -bgWidth * 1.5f)
+            {
+                // 如果即將被刪除的背景正好是當前記錄的背景，重置它
+                if (lastActiveBg == firstBg) lastActiveBg = null;
+
+                activeBackgrounds.RemoveAt(0);
+                Destroy(firstBg.gameObject);
+            }
+        }
+
+        // 5. 【核心修復】：繪製波形與跨背景切換保護
+        RectTransform currentTargetBg = GetBackgroundUnderPoint(trackerPoint.position);
+        if (currentTargetBg != null)
+        {
+            Vector2 localPoint = currentTargetBg.InverseTransformPoint(trackerPoint.position);
+
+            // 如果背景切換了（從上一張滑到了新一張），強制重設起點，絕對不跨背景拉連線！
+            if (currentTargetBg != lastActiveBg)
+            {
+                lastActiveBg = currentTargetBg;
+                isFirstPoint = true;
+            }
+
+            if (isFirstPoint)
+            {
+                lastDrawnPoint = localPoint;
+                isFirstPoint = false;
+            }
+            else
+            {
+                if (Vector2.Distance(lastDrawnPoint, localPoint) >= minSegmentDistance)
+                {
+                    CreateUISegment(currentTargetBg, lastDrawnPoint, localPoint);
+                    lastDrawnPoint = localPoint;
+                }
+            }
+        }
+        else
+        {
+            isFirstPoint = true;
+            lastActiveBg = null;
+        }
 
         if (Input.GetKeyDown(KeyCode.Space))
         {
@@ -173,21 +209,57 @@ public class HipsWaveTracker : MonoBehaviour
         }
     }
 
-    void CreateUISegment(Vector2 start, Vector2 end)
+    void SpawnNextBackground()
+    {
+        RectTransform previousBg = activeBackgrounds[activeBackgrounds.Count - 1];
+
+        GameObject newBgObj = Instantiate(cleanBgPrefab, waveBackground.parent);
+        newBgObj.name = "WaveBackground_Seamless";
+        newBgObj.SetActive(true);
+
+        RectTransform newRect = newBgObj.GetComponent<RectTransform>();
+
+        newRect.anchorMin = previousBg.anchorMin;
+        newRect.anchorMax = previousBg.anchorMax;
+        newRect.pivot = previousBg.pivot;
+        newRect.sizeDelta = previousBg.sizeDelta;
+        newRect.anchoredPosition = new Vector2(previousBg.anchoredPosition.x + bgWidth, previousBg.anchoredPosition.y);
+
+        newBgObj.transform.SetSiblingIndex(trackerPoint.GetSiblingIndex());
+
+        activeBackgrounds.Add(newRect);
+    }
+
+    RectTransform GetBackgroundUnderPoint(Vector3 worldPoint)
+    {
+        for (int i = 0; i < activeBackgrounds.Count; i++)
+        {
+            RectTransform bg = activeBackgrounds[i];
+            if (bg == null) continue;
+
+            Vector3 localPos = bg.InverseTransformPoint(worldPoint);
+            if (bg.rect.Contains(localPos))
+            {
+                return bg;
+            }
+        }
+
+        return activeBackgrounds.Count > 0 ? activeBackgrounds[0] : null;
+    }
+
+    void CreateUISegment(RectTransform parentBg, Vector2 start, Vector2 end)
     {
         GameObject segment = new GameObject("UI_Smooth_Line_Segment", typeof(Image));
-        segment.transform.SetParent(waveBackground, false);
-        
-        // 確保線段壓在背景正前方
-        segment.transform.SetAsLastSibling(); 
+        segment.transform.SetParent(parentBg, false);
+        segment.transform.SetAsLastSibling();
 
         Image img = segment.GetComponent<Image>();
-        img.color = Color.red; 
+        img.color = Color.red;
 
         RectTransform rect = segment.GetComponent<RectTransform>();
         rect.anchorMin = new Vector2(0.5f, 0.5f);
         rect.anchorMax = new Vector2(0.5f, 0.5f);
-        rect.pivot = new Vector2(0f, 0.5f); 
+        rect.pivot = new Vector2(0f, 0.5f);
 
         Vector2 dir = end - start;
         float distance = dir.magnitude;
@@ -196,37 +268,16 @@ public class HipsWaveTracker : MonoBehaviour
         rect.anchoredPosition = start;
         rect.sizeDelta = new Vector2(distance, lineWidth);
         rect.localRotation = Quaternion.Euler(0, 0, angle);
-
-        segmentPool.Add(segment);
     }
 
-    void ClearExistingChildSegments(Transform parent)
+    void ClearChildSegmentsImmediate(Transform parent)
     {
         for (int i = parent.childCount - 1; i >= 0; i--)
         {
             Transform child = parent.GetChild(i);
             if (child != trackerPoint)
             {
-                Destroy(child.gameObject);
-            }
-        }
-    }
-
-    void CleanupOffscreenSegments()
-    {
-        // 清理超過背景左邊界的線段段落，保持極佳效能
-        float leftBoundary = -bgWidth * 1.5f;
-        for (int i = segmentPool.Count - 1; i >= 0; i--)
-        {
-            GameObject seg = segmentPool[i];
-            if (seg != null)
-            {
-                RectTransform rect = seg.GetComponent<RectTransform>();
-                if (rect.anchoredPosition.x < leftBoundary)
-                {
-                    Destroy(seg);
-                    segmentPool.RemoveAt(i);
-                }
+                DestroyImmediate(child.gameObject);
             }
         }
     }
@@ -242,14 +293,24 @@ public class HipsWaveTracker : MonoBehaviour
         fadeTimer += Time.deltaTime;
         float alpha = Mathf.Lerp(1f, 0f, fadeTimer / fadeOutDuration);
 
-        if (canvasGroup1 != null) canvasGroup1.alpha = alpha;
-        if (canvasGroup2 != null) canvasGroup2.alpha = alpha;
+        foreach (var bg in activeBackgrounds)
+        {
+            if (bg != null)
+            {
+                CanvasGroup cg = bg.GetComponent<CanvasGroup>();
+                if (cg == null) cg = bg.gameObject.AddComponent<CanvasGroup>();
+                cg.alpha = alpha;
+            }
+        }
 
         if (alpha <= 0.01f)
         {
-            waveBackground.gameObject.SetActive(false);
-            if (waveBackground2 != null) waveBackground2.gameObject.SetActive(false);
-            gameObject.SetActive(false); 
+            foreach (var bg in activeBackgrounds)
+            {
+                if (bg != null) bg.gameObject.SetActive(false);
+            }
+            if (cleanBgPrefab != null) Destroy(cleanBgPrefab);
+            gameObject.SetActive(false);
         }
     }
 }
