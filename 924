@@ -1,0 +1,520 @@
+using UnityEngine;
+using UnityEngine.UI;
+using TMPro; // 引入 TextMeshPro 命名空間
+using System.Collections.Generic;
+
+public class HipsWaveTracker : MonoBehaviour
+{
+    [Header("開始畫面設定")]
+    public GameObject startMenuPanel;
+    public bool isGameStarted = false;
+
+    [Header("偵測對象")]
+    public Transform hipsTransform;
+    public Transform footTransform;
+
+    [Header("UI 顯示物件")]
+    public RectTransform waveBackground;   // 當前顯示的第一張白色背景
+    public RectTransform trackerPoint;     // 玩家紅點
+    public TextMeshProUGUI scoreText;      // 右上角顯示分數的 TextMeshPro 元件
+
+    [Header("波形參數設定")]
+    public float waveSpeed = 80f;
+    public float lineWidth = 5f;
+    public float amplitudeMultiplier = 1.8f;
+
+    [Header("平滑度設定")]
+    public float smoothTime = 0.08f;
+    public float minSegmentDistance = 1.5f;
+
+    [Header("標準參考軌跡設定 (最高點起步 -> 下蹲2s -> 停頓1s -> 起立2s)")]
+    public bool enableGuideWave = true;
+    public Color guideLineColor = new Color(0f, 0.6f, 1f, 0.75f); // 半透明天藍色
+    public float guideLineWidth = 4f;
+    [Range(0.1f, 1f)]
+    [Tooltip("標準線下凹振幅比例")]
+    public float guideAmplitude = 0.5f; 
+    public float squatDownDuration = 2f; // 下蹲 2 秒
+    public float holdDuration = 1f;      // 底部停頓 1 秒
+    public float standUpDuration = 2f;   // 起立 2 秒
+
+    [Header("評分系統設定 (角度60% / 頻率節奏40%)")]
+    [Tooltip("深度與角度權重 (預設 0.6 即 60%)")]
+    [Range(0f, 1f)] public float depthWeight = 0.6f;
+    [Tooltip("節奏與速度權重 (預設 0.4 即 40%)")]
+    [Range(0f, 1f)] public float rhythmWeight = 0.4f;
+
+    [Tooltip("True: 即時動態分數 (手抖馬上掉分); False: 累計平均分 (平穩推薦)")]
+    public bool showInstantScore = false;
+    private float totalScoreSum = 0f;
+    private int scoreSampleCount = 0;
+    private float displayedScore = 100f;
+
+    // 速度計算用變數 (用於計算頻率與節奏)
+    private float lastPlayerUIY;
+    private float lastGuideUIY;
+
+    [Header("動態淡出消失設定")]
+    public float fadeOutDuration = 2f;
+
+    // 背景動態佇列
+    private List<RectTransform> activeBackgrounds = new List<RectTransform>();
+    private GameObject cleanBgPrefab; 
+    private float bgWidth;
+
+    // 玩家紅線繪製變數
+    private RectTransform lastActiveBg = null;
+    private Vector2 lastDrawnPoint;
+    private bool isFirstPoint = true;
+
+    // 標準引導線繪製變數
+    private RectTransform lastGuideActiveBg = null;
+    private Vector2 lastGuideDrawnPoint;
+    private bool isGuideFirstPoint = true;
+    private float guideTimer = 0f;
+    private float currentGuideUIY; 
+
+    private float fixedX;
+    private float startY;
+
+    private float maxHipsY;
+    private float minHipsY;
+    private float hipsMoveRange;
+    private float uiBottomY;
+    private float uiMoveRange;
+    private bool isInitialized = false;
+
+    private float currentUIY;
+    private float yVelocity = 0f;
+
+    private bool isFinished = false;
+    private float fadeTimer = 0f;
+
+    void Start()
+    {
+        // 1. 開啟開始選單
+        if (startMenuPanel != null)
+        {
+            startMenuPanel.SetActive(true);
+        }
+
+        // 2. 封面還沒按 Start 之前，先將分數文字隱藏
+        if (scoreText != null)
+        {
+            scoreText.gameObject.SetActive(false);
+        }
+
+        if (waveBackground != null && trackerPoint != null)
+        {
+            trackerPoint.anchorMin = new Vector2(0.5f, 0.5f);
+            trackerPoint.anchorMax = new Vector2(0.5f, 0.5f);
+            trackerPoint.pivot = new Vector2(0.5f, 0.5f);
+
+            fixedX = trackerPoint.position.x;
+            startY = trackerPoint.localPosition.y;
+            currentUIY = startY;
+            lastPlayerUIY = startY;
+            lastGuideUIY = startY;
+
+            uiBottomY = -waveBackground.rect.height / 2f;
+            uiMoveRange = startY - uiBottomY;
+            bgWidth = waveBackground.rect.width;
+
+            ClearChildSegmentsImmediate(waveBackground);
+
+            // 製作純白空殼樣板
+            cleanBgPrefab = Instantiate(waveBackground.gameObject, waveBackground.parent);
+            cleanBgPrefab.name = "Clean_WaveBackground_Template";
+            ClearChildSegmentsImmediate(cleanBgPrefab.transform);
+            cleanBgPrefab.SetActive(false);
+
+            activeBackgrounds.Add(waveBackground);
+            SpawnNextBackground();
+        }
+    }
+
+    public void StartGame()
+    {
+        if (startMenuPanel != null)
+        {
+            startMenuPanel.SetActive(false);
+        }
+
+        // 按下 Start 後才顯示分數文字並初始化
+        if (scoreText != null)
+        {
+            scoreText.gameObject.SetActive(true);
+        }
+
+        isGameStarted = true;
+        isInitialized = false;
+        isFirstPoint = true;
+        isGuideFirstPoint = true;
+        lastActiveBg = null;
+        lastGuideActiveBg = null;
+        guideTimer = 0f;
+
+        // 重置分數狀態
+        totalScoreSum = 0f;
+        scoreSampleCount = 0;
+        displayedScore = 100f;
+        lastPlayerUIY = startY;
+        lastGuideUIY = startY;
+        UpdateScoreUI(100f);
+    }
+
+    void Update()
+    {
+        if (!isGameStarted) return;
+        if (hipsTransform == null || trackerPoint == null || waveBackground == null || footTransform == null) return;
+
+        if (!isInitialized)
+        {
+            maxHipsY = hipsTransform.position.y;
+            minHipsY = footTransform.position.y;
+            hipsMoveRange = maxHipsY - minHipsY;
+            if (hipsMoveRange <= 0) hipsMoveRange = 0.1f;
+
+            isInitialized = true;
+            return;
+        }
+
+        if (isFinished)
+        {
+            HandleFadeOut();
+            return;
+        }
+
+        // 1. 計算玩家實際深蹲數值
+        float squatProgress = (maxHipsY - hipsTransform.position.y) / hipsMoveRange;
+        squatProgress = Mathf.Clamp01(squatProgress);
+
+        float amplifiedProgress = Mathf.Clamp01(squatProgress * amplitudeMultiplier);
+        float targetUIY = startY - (amplifiedProgress * uiMoveRange);
+
+        currentUIY = Mathf.SmoothDamp(currentUIY, targetUIY, ref yVelocity, smoothTime);
+
+        trackerPoint.position = new Vector3(fixedX, trackerPoint.position.y, trackerPoint.position.z);
+        trackerPoint.localPosition = new Vector3(trackerPoint.localPosition.x, currentUIY, trackerPoint.localPosition.z);
+
+        // 2. 背景向左推移
+        Vector2 moveStep = Vector2.left * waveSpeed * Time.deltaTime;
+        for (int i = 0; i < activeBackgrounds.Count; i++)
+        {
+            if (activeBackgrounds[i] != null)
+            {
+                activeBackgrounds[i].anchoredPosition += moveStep;
+            }
+        }
+
+        // 3. 無縫接軌檢測
+        RectTransform lastBg = activeBackgrounds[activeBackgrounds.Count - 1];
+        float lastBgRightEdge = lastBg.anchoredPosition.x + (bgWidth * (1f - lastBg.pivot.x));
+
+        if (lastBgRightEdge <= bgWidth * 1.5f)
+        {
+            SpawnNextBackground();
+        }
+
+        // 4. 左側背景超出視野後銷毀
+        if (activeBackgrounds.Count > 0)
+        {
+            RectTransform firstBg = activeBackgrounds[0];
+            float firstBgRightEdge = firstBg.anchoredPosition.x + (bgWidth * (1f - firstBg.pivot.x));
+            
+            if (firstBgRightEdge < -bgWidth * 1.5f)
+            {
+                if (lastActiveBg == firstBg) lastActiveBg = null;
+                if (lastGuideActiveBg == firstBg) lastGuideActiveBg = null;
+
+                activeBackgrounds.RemoveAt(0);
+                Destroy(firstBg.gameObject);
+            }
+        }
+
+        // 5. 繪製標準動作波形 (藍色)
+        if (enableGuideWave)
+        {
+            DrawGuideWave();
+        }
+
+        // 6. 繪製玩家軌跡 (紅色)
+        DrawPlayerWave();
+
+        // 7. 計算評分 (蹲的角度 60% + 頻率節奏 40%)
+        CalculateAndDisplayScore();
+
+        if (Input.GetKeyDown(KeyCode.Space))
+        {
+            FinishAndFadeOut();
+        }
+    }
+
+    // 評分計算 (角度 60% + 頻率節奏 40%)
+    void CalculateAndDisplayScore()
+    {
+        if (!enableGuideWave || scoreText == null || Time.deltaTime <= 0.0001f) return;
+
+        // ---【1. 蹲的角度與深度評分 (60%)】---
+        float errorDistance = Mathf.Abs(currentUIY - currentGuideUIY);
+        float maxAllowedError = Mathf.Max(uiMoveRange * guideAmplitude, 30f);
+        // 0 ~ 1 的精準度
+        float depthAccuracy = 1f - Mathf.Clamp01(errorDistance / maxAllowedError);
+        depthAccuracy = Mathf.Pow(depthAccuracy, 1.2f); // 柔和加權曲線
+
+        // ---【2. 頻率與節奏評分 (40%)】---
+        // 計算這一幀的移動速度 (垂直位移 / 時間)
+        float playerVelocity = (currentUIY - lastPlayerUIY) / Time.deltaTime;
+        float guideVelocity = (currentGuideUIY - lastGuideUIY) / Time.deltaTime;
+
+        // 計算速度差距與方向一致性
+        float maxExpectedVelocity = (uiMoveRange * guideAmplitude) / squatDownDuration; // 標準最大速度參考
+        float velocityError = Mathf.Abs(playerVelocity - guideVelocity);
+        float rhythmAccuracy = 1f - Mathf.Clamp01(velocityError / (maxExpectedVelocity * 2.5f));
+
+        // 更新上一幀座標以供下一次微分
+        lastPlayerUIY = currentUIY;
+        lastGuideUIY = currentGuideUIY;
+
+        // ---【3. 加權綜合成 1 ~ 100 分】---
+        float combinedAccuracy = (depthAccuracy * depthWeight) + (rhythmAccuracy * rhythmWeight);
+        float instantScore = Mathf.Lerp(1f, 100f, Mathf.Clamp01(combinedAccuracy));
+
+        if (showInstantScore)
+        {
+            displayedScore = Mathf.Lerp(displayedScore, instantScore, Time.deltaTime * 5f);
+        }
+        else
+        {
+            totalScoreSum += instantScore;
+            scoreSampleCount++;
+            float averageScore = totalScoreSum / scoreSampleCount;
+            displayedScore = Mathf.Lerp(displayedScore, averageScore, Time.deltaTime * 8f);
+        }
+
+        UpdateScoreUI(displayedScore);
+    }
+
+    void UpdateScoreUI(float score)
+    {
+        if (scoreText == null) return;
+
+        int finalScoreInt = Mathf.Clamp(Mathf.RoundToInt(score), 1, 100);
+        scoreText.text = $"Score: {finalScoreInt}";
+
+        if (finalScoreInt >= 85)
+            scoreText.color = new Color(0.2f, 1f, 0.2f); // 綠色
+        else if (finalScoreInt >= 60)
+            scoreText.color = new Color(1f, 0.85f, 0.1f); // 亮黃色
+        else
+            scoreText.color = new Color(1f, 0.3f, 0.3f); // 警示紅
+    }
+
+    void DrawPlayerWave()
+    {
+        RectTransform currentTargetBg = GetBackgroundUnderPoint(trackerPoint.position);
+        if (currentTargetBg != null)
+        {
+            Vector2 localPoint = currentTargetBg.InverseTransformPoint(trackerPoint.position);
+
+            if (currentTargetBg != lastActiveBg)
+            {
+                lastActiveBg = currentTargetBg;
+                isFirstPoint = true;
+            }
+
+            if (isFirstPoint)
+            {
+                lastDrawnPoint = localPoint;
+                isFirstPoint = false;
+            }
+            else
+            {
+                if (Vector2.Distance(lastDrawnPoint, localPoint) >= minSegmentDistance)
+                {
+                    CreateUISegment(currentTargetBg, lastDrawnPoint, localPoint, Color.red, lineWidth);
+                    lastDrawnPoint = localPoint;
+                }
+            }
+        }
+        else
+        {
+            isFirstPoint = true;
+            lastActiveBg = null;
+        }
+    }
+
+    void DrawGuideWave()
+    {
+        guideTimer += Time.deltaTime;
+        float totalCycle = squatDownDuration + holdDuration + standUpDuration; // 5 秒
+        float cycleTime = guideTimer % totalCycle;
+
+        float progress = 0f;
+
+        if (cycleTime < squatDownDuration)
+        {
+            // 階段 1：下蹲 2 秒
+            float t = cycleTime / squatDownDuration;
+            progress = Mathf.SmoothStep(0f, 1f, t);
+        }
+        else if (cycleTime < squatDownDuration + holdDuration)
+        {
+            // 階段 2：底部停頓 1 秒
+            progress = 1f;
+        }
+        else
+        {
+            // 階段 3：起立回到頂部 2 秒
+            float t = (cycleTime - squatDownDuration - holdDuration) / standUpDuration;
+            progress = Mathf.SmoothStep(1f, 0f, t);
+        }
+
+        currentGuideUIY = startY - (progress * guideAmplitude * uiMoveRange);
+
+        Vector3 guideLocalPos = new Vector3(trackerPoint.localPosition.x, currentGuideUIY, 0f);
+        Vector3 guideWorldPos = trackerPoint.parent.TransformPoint(guideLocalPos);
+
+        RectTransform currentTargetBg = GetBackgroundUnderPoint(guideWorldPos);
+        if (currentTargetBg != null)
+        {
+            Vector2 localGuidePoint = currentTargetBg.InverseTransformPoint(guideWorldPos);
+
+            if (currentTargetBg != lastGuideActiveBg)
+            {
+                lastGuideActiveBg = currentTargetBg;
+                isGuideFirstPoint = true;
+            }
+
+            if (isGuideFirstPoint)
+            {
+                lastGuideDrawnPoint = localGuidePoint;
+                isGuideFirstPoint = false;
+            }
+            else
+            {
+                if (Vector2.Distance(lastGuideDrawnPoint, localGuidePoint) >= minSegmentDistance)
+                {
+                    CreateUISegment(currentTargetBg, lastGuideDrawnPoint, localGuidePoint, guideLineColor, guideLineWidth);
+                    lastGuideDrawnPoint = localGuidePoint;
+                }
+            }
+        }
+        else
+        {
+            isGuideFirstPoint = true;
+            lastGuideActiveBg = null;
+        }
+    }
+
+    void SpawnNextBackground()
+    {
+        RectTransform previousBg = activeBackgrounds[activeBackgrounds.Count - 1];
+
+        GameObject newBgObj = Instantiate(cleanBgPrefab, waveBackground.parent);
+        newBgObj.name = "WaveBackground_Seamless";
+        newBgObj.SetActive(true);
+
+        RectTransform newRect = newBgObj.GetComponent<RectTransform>();
+
+        newRect.anchorMin = previousBg.anchorMin;
+        newRect.anchorMax = previousBg.anchorMax;
+        newRect.pivot = previousBg.pivot;
+        newRect.sizeDelta = previousBg.sizeDelta;
+        newRect.anchoredPosition = new Vector2(previousBg.anchoredPosition.x + bgWidth, previousBg.anchoredPosition.y);
+
+        newBgObj.transform.SetSiblingIndex(trackerPoint.GetSiblingIndex());
+
+        activeBackgrounds.Add(newRect);
+    }
+
+    RectTransform GetBackgroundUnderPoint(Vector3 worldPoint)
+    {
+        for (int i = 0; i < activeBackgrounds.Count; i++)
+        {
+            RectTransform bg = activeBackgrounds[i];
+            if (bg == null) continue;
+
+            Vector3 localPos = bg.InverseTransformPoint(worldPoint);
+            if (bg.rect.Contains(localPos))
+            {
+                return bg;
+            }
+        }
+
+        return activeBackgrounds.Count > 0 ? activeBackgrounds[0] : null;
+    }
+
+    void CreateUISegment(RectTransform parentBg, Vector2 start, Vector2 end, Color color, float width)
+    {
+        GameObject segment = new GameObject("UI_Smooth_Line_Segment", typeof(Image));
+        segment.transform.SetParent(parentBg, false);
+        segment.transform.SetAsLastSibling();
+
+        Image img = segment.GetComponent<Image>();
+        img.color = color;
+
+        RectTransform rect = segment.GetComponent<RectTransform>();
+        rect.anchorMin = new Vector2(0.5f, 0.5f);
+        rect.anchorMax = new Vector2(0.5f, 0.5f);
+        rect.pivot = new Vector2(0f, 0.5f);
+
+        Vector2 dir = end - start;
+        float distance = dir.magnitude;
+        float angle = Mathf.Atan2(dir.y, dir.x) * Mathf.Rad2Deg;
+
+        rect.anchoredPosition = start;
+        rect.sizeDelta = new Vector2(distance, width);
+        rect.localRotation = Quaternion.Euler(0, 0, angle);
+    }
+
+    void ClearChildSegmentsImmediate(Transform parent)
+    {
+        for (int i = parent.childCount - 1; i >= 0; i--)
+        {
+            Transform child = parent.GetChild(i);
+            if (child != trackerPoint)
+            {
+                DestroyImmediate(child.gameObject);
+            }
+        }
+    }
+
+    public void FinishAndFadeOut()
+    {
+        isFinished = true;
+        fadeTimer = 0f;
+    }
+
+    private void HandleFadeOut()
+    {
+        fadeTimer += Time.deltaTime;
+        float alpha = Mathf.Lerp(1f, 0f, fadeTimer / fadeOutDuration);
+
+        foreach (var bg in activeBackgrounds)
+        {
+            if (bg != null)
+            {
+                CanvasGroup cg = bg.GetComponent<CanvasGroup>();
+                if (cg == null) cg = bg.gameObject.AddComponent<CanvasGroup>();
+                cg.alpha = alpha;
+            }
+        }
+
+        if (alpha <= 0.01f)
+        {
+            foreach (var bg in activeBackgrounds)
+            {
+                if (bg != null) bg.gameObject.SetActive(false);
+            }
+            if (cleanBgPrefab != null) Destroy(cleanBgPrefab);
+
+            if (scoreText != null)
+            {
+                scoreText.gameObject.SetActive(false);
+            }
+
+            gameObject.SetActive(false);
+        }
+    }
+}
